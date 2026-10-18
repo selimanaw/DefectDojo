@@ -213,7 +213,7 @@ sufficient for a demonstration but is not production-equivalent.
    ```bash
    ./run-unittest.sh --test-case unittests.test_deduplication_logic.TestHashFieldsNormalisation
    ```
-   Nine tests pass, including the pinned regression value and three Unicode whitespace variants.
+   Seven tests pass (this class only), including the pinned regression value and three Unicode whitespace variants.
 3. Open `dojo/finding/deduplication.py` and show the `WARNING`-level log message with scan-type interpolation.
 
 ### What to show for Phase 2
@@ -249,6 +249,28 @@ Sample scan files are included in `unittests/scans/`. To demonstrate a ZAP impor
 | `docker compose up` fails immediately | Docker not running | Start Docker Desktop |
 | Port 8080 already in use | Another service on that port | `docker compose down` or change `DD_PORT` in `.env` |
 | Initializer exits with error | Postgres not ready | Wait 30 sec and re-run `docker compose up -d` |
-| Admin password not in logs | Initializer already ran (data volume exists) | `docker compose down -v` then `up -d` again |
+| Admin password not in logs | Initializer already ran (data volume exists) | Reset via Django admin shell — see below |
 | ngrok shows `ERR_NGROK_3200` | Not authenticated | Run `ngrok config add-authtoken <token>` |
 | Railway deploy fails OOM | Free plan RAM limit | Upgrade to Trial plan or use Option A + ngrok |
+
+### Resetting the admin password (non-destructive)
+
+If the admin password was not captured from the initializer log and the data volume already exists,
+reset it without destroying any data:
+
+```bash
+# Open a Django shell inside the running container
+docker compose exec uwsgi python manage.py shell -c \
+  "from django.contrib.auth import get_user_model; \
+   U = get_user_model(); \
+   u = U.objects.get(username='admin'); \
+   u.set_password('NewPassword123!'); \
+   u.save(); \
+   print('Password updated.')"
+```
+
+Replace `NewPassword123!` with a password of your choice. The application and all data remain intact.
+For official documentation see the [DefectDojo Administration guide](https://defectdojo.github.io/django-DefectDojo/getting_started/running-in-production/).
+
+> ⚠️ **Do not use `docker compose down -v`** to recover a password — it deletes all database volumes
+> and permanently removes all findings, products, and configuration data.

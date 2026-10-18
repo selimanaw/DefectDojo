@@ -85,9 +85,12 @@ value.casefold().strip().encode("utf-8")
 #               ^^^^^^^ strips Unicode whitespace, then encodes
 ```
 
-This is a one-character reordering with zero effect on real-world stored hashes — all supported parsers
-produce ASCII-only CVE IDs, file paths, and titles with no leading or trailing whitespace. A hash difference
-can only arise for values with leading or trailing non-ASCII whitespace, which no supported parser produces.
+For ordinary inputs — ASCII CVE IDs, file paths, and titles with no leading or trailing whitespace — the
+two orderings produce identical output, so stored hashes from supported parsers are expected to be
+unaffected. A hash difference will arise only for values with leading or trailing non-ASCII whitespace
+(e.g. U+00A0 NO-BREAK SPACE, U+2003 EM SPACE). Any finding whose hash field contained such characters
+will receive a corrected hash on next import and may not match the previously-stored value; those findings
+will be re-imported rather than deduplicated against the old record.
 
 #### Diagnostic visibility
 
@@ -119,22 +122,27 @@ to `WARNING`, with the scan type name and a suppression hint.
 #### The optimisation
 
 `BaseImporter.persist_new_findings()` was refactored to collect all new findings into a list and insert them
-in a single `bulk_create()` call, then batch all `found_by` many-to-many relationships using
-`ManyToManyField.set()`. The entire operation is wrapped in `transaction.atomic()` to guarantee
-all-or-nothing consistency.
+in a single `bulk_create()` call, then write all `found_by` many-to-many relationships in a single
+follow-up `bulk_create()` on the M2M through table. The entire operation is wrapped in
+`transaction.atomic()` to guarantee all-or-nothing consistency.
 
 ```python
-# AFTER — single bulk INSERT + one batched M2M update
+# AFTER — single bulk INSERT + one batched M2M INSERT via through table
 with transaction.atomic():
-    created = Finding.objects.bulk_create(findings_to_create)
-    if created:
-        test_type = test.test_type
-        for finding in created:
-            finding.found_by.set([test_type])
+    saved_findings = Finding.objects.bulk_create(prepared_findings, batch_size=1000)
+    if saved_findings:
+        test_type = saved_findings[0].test.test_type
+        through = Finding.found_by.through
+        through.objects.bulk_create(
+            [through(finding_id=f.pk, test_type_id=test_type.pk) for f in saved_findings],
+            batch_size=1000,
+            ignore_conflicts=True,
+        )
 ```
 
-`DefaultReImporter.persist_new_findings()` was updated to call the base implementation, preserving the
-reimport code path and all subclass extension points.
+`DefaultReImporter.persist_new_findings()` overrides the base class with a per-finding loop via
+`persist_new_finding()`. This preserves a per-finding deferral seam that downstream editions rely on;
+the reimporter does not use the `bulk_create` path.
 
 #### Query reduction (ZAP 19-finding scan, measured by `assertNumQueries`)
 
@@ -145,8 +153,8 @@ reimport code path and all subclass extension points.
 | Reimport (no change) | 80 | 80 | unchanged |
 | Reimport (with new findings) | 159 | 159 | unchanged |
 
-Reimport counts are unchanged because `DefaultReImporter` delegates to the same base method;
-the bulk path applies equally.
+Reimport counts are unchanged because `DefaultReImporter.persist_new_findings()` keeps its own
+per-finding loop (to preserve a downstream extension seam) and does not use the `bulk_create` path.
 
 ---
 
@@ -158,7 +166,7 @@ the bulk path applies equally.
 | REST API | Django REST Framework |
 | Task queue | Celery + Valkey (Redis-compatible) |
 | Database | PostgreSQL 14+ |
-| ORM | Django ORM (`bulk_create`, `transaction.atomic`, M2M `.set()`) |
+| ORM | Django ORM (`bulk_create`, `transaction.atomic`, M2M through-table `bulk_create`) |
 | Containerisation | Docker Compose (nginx + uwsgi + celeryworker + celerybeat + postgres + valkey) |
 | Test framework | Django `TestCase`, `assertNumQueries`, `unittest.mock` |
 | Linting | Ruff |
@@ -179,8 +187,10 @@ concrete and tool-verified — not generic suggestions.
 - **Regression test scaffolding.** Bob generated `TestHashFieldsNormalisation` with seven parameterised
   test cases: ASCII determinism, case folding, ASCII whitespace stripping, each Unicode whitespace variant
   (NBSP, EM SPACE, THIN SPACE), internal space preservation, output format, and a pinned regression value.
-- **Compatibility analysis.** Bob scanned the supported-parser list to confirm that no parser emits
-  non-ASCII whitespace in hash fields, establishing that the fix carries zero migration risk.
+- **Compatibility analysis.** Bob scanned the supported-parser list to confirm that no supported parser
+  produces non-ASCII whitespace in hash fields, so ordinary deployments are expected to see no hash
+  changes; any deployment whose stored hashes did include such characters will receive corrected values
+  on the next import.
 - **Log-level audit.** Bob located all four `DEBUG` calls in `compute_hash_code()` and the one in the
   deduplication task, drafted replacement `WARNING` messages with scan-type context, and verified that
   each message included an actionable suppression hint.
@@ -190,17 +200,18 @@ concrete and tool-verified — not generic suggestions.
 - **Query profiling.** Bob traced the call from `DefaultImporter.process_scan()` through
   `persist_new_findings()` and identified the per-finding `save_no_options()` + `found_by.add()` loop as
   the source of the N+1 pattern.
-- **Bulk insert design.** Bob proposed the `bulk_create()` + `.set()` refactor, explained the Django ORM
-  constraint that `bulk_create()` returns instances without triggering `post_save` signals (which
-  `save_no_options` also skips), and confirmed the two paths are semantically equivalent.
+- **Bulk insert design.** Bob proposed the `bulk_create()` + through-table `bulk_create()` refactor,
+  explained the Django ORM constraint that `bulk_create()` returns instances without triggering
+  `post_save` signals (which `save_no_options` also skips), and confirmed the two paths are
+  semantically equivalent.
 - **Transaction boundary.** Bob noted the absence of an atomic block and suggested wrapping the persist
   operation in `transaction.atomic()` to prevent partial-import states.
 - **Test coverage design.** Bob drafted `test_bulk_persist_new_findings.py` (914 lines, 19 tests + 1
   skipped) covering correctness, `found_by` relationships, deduplication interaction, rollback on
   exception, and reimport compatibility.
 - **Baseline update guidance.** Bob identified which `assertNumQueries` baselines would change (import
-  only, not reimport) and explained why (reimport delegates to the same base method, so its per-finding
-  path is also replaced, keeping its count identical to before).
+  only, not reimport) and explained why (`DefaultReImporter` keeps its own per-finding loop and does not
+  use the `bulk_create` path, so its query count is unchanged).
 
 ---
 
