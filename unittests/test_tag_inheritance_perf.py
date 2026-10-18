@@ -653,8 +653,11 @@ class TagInheritanceImportPerfBaselines(DojoAPITestCase):
     # the recipient count no longer moves the total: pinning user5 to non-superuser
     # (which took 12 import / 6 reimport-with-new queries off the per-recipient path)
     # measures the same with and without the pin on this path.
-    EXPECTED_ZAP_IMPORT_V2 = 289
-    EXPECTED_ZAP_IMPORT_V3 = 315
+    # -20 import (both modes): Phase 2 bulk-import optimization replaces N per-finding
+    # save_no_options() + found_by.add() calls with bulk_create() in BaseImporter,
+    # reducing the 19-finding ZAP import from N*3 individual queries to 3 batch queries.
+    EXPECTED_ZAP_IMPORT_V2 = 269
+    EXPECTED_ZAP_IMPORT_V3 = 295
     EXPECTED_ZAP_REIMPORT_NO_CHANGE_V2 = 80
     EXPECTED_ZAP_REIMPORT_NO_CHANGE_V3 = 91
     EXPECTED_ZAP_REIMPORT_WITH_NEW_V2 = 159

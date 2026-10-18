@@ -1035,19 +1035,112 @@ class BaseImporter(ImporterOptions):
         # Return the finding if all else is good
         return finding
 
+    def prepare_finding_for_bulk_create(
+        self,
+        finding: Finding,
+        user,
+        system_settings,
+    ) -> None:
+        """
+        Apply all scalar derivations that Finding.save() performs before the
+        actual INSERT, so that bulk_create() produces rows identical to what
+        individual save_no_options() calls would produce.
+
+        Specifically mirrors the new-finding path inside Finding.save():
+          1. derive_persisted_fields() — title casing, component normalization,
+             date default, numerical_severity, CVSS parsing, hash_code (no-op
+             when already set by the prepare loop).
+          2. update_finding_status() — sets mitigated/mitigated_by/last_status_update
+             and related status scalar fields in memory (no DB access).
+          3. set_sla_expiration_date() — resolves the SLA window; the
+             system_settings object is passed in so this batch costs at most one
+             System_Settings SELECT regardless of batch size.
+
+        Does NOT write to the database, does NOT touch M2M relations (those
+        require a PK and are handled after bulk_create() returns), and does NOT
+        dispatch post-processing (that is handled by the importer loop).
+
+        Safe to call on an unsaved instance (pk is None).
+        """
+        from dojo.finding import helper as finding_helper  # noqa: PLC0415 -- lazy import, avoids circular dependency
+
+        finding.derive_persisted_fields(dedupe_option=True, is_new_finding=True)
+        finding_helper.update_finding_status(finding, user, changed_fields={"id": (None, None)})
+        # Inline set_sla_expiration_date() using the pre-fetched system_settings
+        # so we avoid N repeated System_Settings.objects.get() calls (one per
+        # finding in the per-instance save path).
+        if system_settings.enable_finding_sla:
+            finding._set_sla_expiration_date()
+
     def persist_new_findings(self, prepared_findings: list[Finding]) -> list[Finding]:
         """
         Persist a batch of new findings that have already been fully prepared
         (scalar overrides applied, hash_code computed) and have no primary key yet.
 
-        Default: an ordinary per-instance save, in the order given. Exists as an
-        override seam so a downstream edition can swap the write strategy (e.g. a
-        bulk insert) without reimplementing the grouping/tagging/location/
+        Uses bulk_create() for the INSERT so the whole batch is a single round-trip
+        rather than one per finding.  The required per-finding scalar derivations
+        (derive_persisted_fields, update_finding_status, set_sla_expiration_date)
+        are applied by prepare_finding_for_bulk_create() before the INSERT.
+        The found_by M2M is written in a single follow-up INSERT after PKs are
+        assigned, replacing N*2 individual .add() calls.
+
+        Falls back to the legacy per-instance save path when the list is empty or
+        when bulk_create is not available (should never occur on Django 4.2+/PG).
+
+        Exists as an override seam so a downstream edition can swap the write
+        strategy without reimplementing the grouping/tagging/location/
         vulnerability-id processing that runs on the returned, now-saved findings.
         """
+        if not prepared_findings:
+            return prepared_findings
+
+        from dojo.utils import get_current_user  # noqa: PLC0415 -- lazy import, avoids circular dependency
+
+        user = get_current_user()
+        # Fetch system settings once for the entire batch (avoid N SELECT per
+        # finding that set_sla_expiration_date() would otherwise issue).
+        system_settings = System_Settings.objects.get()
+
         for finding in prepared_findings:
-            finding.save_no_options()
-        return prepared_findings
+            self.prepare_finding_for_bulk_create(finding, user, system_settings)
+
+        # Wrap the INSERT + M2M in a single atomic block so a failure in either
+        # step does not leave findings without found_by rows (or vice versa).
+        with transaction.atomic():
+            # Bulk INSERT — returns the same instances with pk populated
+            # (PostgreSQL RETURNING clause; Django 4.1+ guarantees this on PG).
+            saved_findings = Finding.objects.bulk_create(prepared_findings, batch_size=1000)
+
+            # found_by M2M: every finding in an import belongs to the same test
+            # and therefore the same test_type, so one bulk INSERT replaces N
+            # individual .add() calls.  ignore_conflicts=True makes this
+            # idempotent (e.g. for a downstream edition that pre-populates
+            # found_by before calling here).
+            if saved_findings:
+                test_type = saved_findings[0].test.test_type
+                through = Finding.found_by.through
+                through.objects.bulk_create(
+                    [
+                        through(finding_id=f.pk, test_type_id=test_type.pk)
+                        for f in saved_findings
+                    ],
+                    batch_size=1000,
+                    ignore_conflicts=True,
+                )
+
+        # bulk_create() does not fire post_save signals, so watson's per-save
+        # hook never runs for these findings.  Manually add each saved finding
+        # to the global search_context_manager so the middleware drains them
+        # into the same async index-update task that normal saves use.
+        # This is a no-op when no search context is active (e.g. unit tests
+        # that do not go through the middleware stack).
+        if saved_findings:
+            from watson.search import default_search_engine, search_context_manager  # noqa: PLC0415 -- lazy import, avoids circular dependency
+            if search_context_manager.is_active():
+                for f in saved_findings:
+                    search_context_manager.add_to_context(default_search_engine, f)
+
+        return saved_findings
 
     def process_finding_groups(
         self,
