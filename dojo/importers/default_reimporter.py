@@ -1317,36 +1317,42 @@ class DefaultReImporter(BaseImporter, DefaultReImporterOptions):
         """
         Write a single finding the report did not match to an existing one.
 
-        Called once per finding, by this class's persist_new_findings() default below --
-        not directly by process_finding_that_was_not_matched() any more, now that new
-        findings are queued (see _pending_new_findings) and persist_new_findings() writes
-        the whole matching batch at once via _drain_pending_new_findings().
+        Called once per finding by persist_new_findings() below -- not directly by
+        process_finding_that_was_not_matched() any more, now that new findings are
+        queued (see _pending_new_findings) and persist_new_findings() writes the
+        whole matching batch at once via _drain_pending_new_findings().
 
-        This is intentionally a separate method (like get_original_findings and
-        get_reimport_match_candidates_for_batch) so a downstream edition can defer just
-        the write for a single finding -- accumulate here, and drain the buffer in
-        _flush_post_processing_batch (before calling super(), so the rows exist by the
-        time anything in that block reads a primary key) -- without reimplementing
-        persist_new_findings() or copying process_finding_that_was_not_matched(). An
-        edition that instead wants one bulk multi-row write for the whole batch overrides
-        persist_new_findings() directly.
+        This is intentionally a separate method so a downstream edition can defer
+        just the write for a single finding -- accumulate here, and drain the buffer
+        in _flush_post_processing_batch (before calling super(), so the rows exist
+        by the time anything in that block reads a primary key) -- without
+        reimplementing persist_new_findings() or copying
+        process_finding_that_was_not_matched(). An edition that instead wants one
+        bulk multi-row write for the whole batch overrides persist_new_findings()
+        directly.
 
-        Overriding this is a supported way to defer the write. Everything between the
-        original call site and here -- grouping, the new_items list, request/response
-        pairs -- is safe on an unwritten finding, and that work is deliberately kept
-        that way.
+        Overriding this is a supported way to defer the write. Everything between
+        the original call site and here -- grouping, the new_items list,
+        request/response pairs -- is safe on an unwritten finding, and that work
+        is deliberately kept that way.
         """
         finding.save_no_options()
 
     def persist_new_findings(self, prepared_findings: list[Finding]) -> list[Finding]:
         """
-        Persist this matching batch's new findings, one at a time via persist_new_finding().
+        Persist this matching batch's new findings, one at a time via
+        persist_new_finding().
 
-        Overrides BaseImporter's per-instance save_no_options() loop so a downstream
-        edition wanting only per-finding deferral (see persist_new_finding()) does not
-        also have to override this method: the default here calls into it, so overriding
-        persist_new_finding() alone is enough. An edition wanting a genuine bulk write
-        instead overrides this method and ignores persist_new_finding() entirely.
+        This override exists to preserve the per-finding deferral seam that
+        downstream editions (Pro) rely on: overriding persist_new_finding() lets
+        an edition accumulate findings and flush them at a controlled point
+        without reimplementing this method.  The base class (BaseImporter) uses a
+        bulk_create() path that bypasses persist_new_finding() entirely; keeping
+        this per-instance loop in DefaultReImporter ensures that contract is
+        honoured for all reimport subclasses.
+
+        An edition that wants a genuine bulk write for reimports and does NOT need
+        the per-finding deferral seam can override this method directly.
         """
         for finding in prepared_findings:
             self.persist_new_finding(finding)
